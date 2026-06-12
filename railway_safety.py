@@ -12,6 +12,7 @@ import time
 import threading
 from datetime import datetime
 from pathlib import Path
+import os
 
 import numpy as np
 import requests
@@ -45,7 +46,10 @@ ALLOWED_CLASSES = {
     "car", "truck", "bus", "motorcycle", "bicycle",
 }
 
-STATUS_JSON_PATH    = Path("status.json")
+STATUS_JSON_PATHS = (
+    Path("front_end/public/status.json"),
+    Path("status.json"),
+)
 EVENT_LOG_PATH      = Path("events.log")
 INCIDENT_IMAGE_PATH = Path("last_incident.jpg")
 
@@ -63,7 +67,9 @@ logging.basicConfig(
 )
 
 def log_event(message: str) -> None:
-    logging.info(message)
+    """Log only critical events (STOP, EMERGENCY, RECONNECT, RESET) - no verbose logging."""
+    if any(keyword in message for keyword in ['STOP', 'EMERGENCY', 'RECONNECT', 'RESET', 'ERROR']):
+        logging.info(message)
 
 
 # ──────────────────────────────────────────────
@@ -173,9 +179,9 @@ class StatusWriter:
                 snapshot = dict(self._state)
             snapshot["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             try:
-                STATUS_JSON_PATH.write_text(
-                    json.dumps(snapshot, indent=2), encoding="utf-8"
-                )
+                payload = json.dumps(snapshot, indent=2)
+                for status_path in STATUS_JSON_PATHS:
+                    status_path.write_text(payload, encoding="utf-8")
             except OSError:
                 pass
             time.sleep(JSON_WRITE_INTERVAL_SEC)
@@ -283,6 +289,52 @@ def draw_detections(frame: np.ndarray,
 
 
 # ──────────────────────────────────────────────
+# DEMO MODE (Synthetic Frame Generator)
+# ──────────────────────────────────────────────
+
+class DemoFrameGenerator:
+    """Generates synthetic frames for testing without hardware."""
+    
+    def __init__(self, width: int = 640, height: int = 480):
+        self.width = width
+        self.height = height
+        self.frame_count = 0
+    
+    def generate_frame(self) -> np.ndarray:
+        """Create a synthetic frame with optional detection overlay."""
+        frame = np.ones((self.height, self.width, 3), dtype=np.uint8) * 50  # Dark background
+        
+        # Draw track polygon
+        track_polygon = np.array([
+            (int(self.width * 0.30), self.height),
+            (int(self.width * 0.70), self.height),
+            (int(self.width * 0.58), int(self.height * 0.40)),
+            (int(self.width * 0.42), int(self.height * 0.40)),
+        ], dtype=np.int32)
+        
+        overlay = frame.copy()
+        cv2.fillPoly(overlay, [track_polygon], (0, 100, 0))
+        cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
+        cv2.polylines(frame, [track_polygon], True, (0, 255, 0), 2)
+        
+        # Draw some text
+        cv2.putText(frame, "DEMO MODE - No Camera", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 2)
+        cv2.putText(frame, f"Frame: {self.frame_count}", (20, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1)
+        
+        # Occasionally add a mock detection
+        if self.frame_count % 60 == 0:  # Every 60 frames, show a mock person
+            x1, y1, x2, y2 = 250, 200, 390, 420
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+            cv2.putText(frame, "PERSON", (x1, y1 - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        
+        self.frame_count += 1
+        return frame
+
+
+# ──────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────
 
@@ -293,17 +345,46 @@ def main() -> None:  # noqa: C901  (complexity expected for a control loop)
     # Map YOLO class index → name for fast lookup
     yolo_names: dict[int, str] = model.names   # {0: 'person', 1: 'bicycle', …}
 
+    startup_writer = StatusWriter({
+        "train_state": "GO",
+        "distance_cm": None,
+        "detection_count": 0,
+        "object": "NONE",
+        "object_detected": "NONE",
+        "track_status": "OFF TRACK",
+        "esp32_status": "DISCONNECTED",
+        "camera_status": "CONNECTING",
+        "stop_reason": "NONE",
+        "stop_latched": False,
+        "detection_max": STOP_THRESHOLD,
+        "track_memory": 0,
+        "distance_safe": True,
+        "distance_thresh": DISTANCE_THRESH,
+        "emergency_brake": False,
+        "frame_index": 0,
+    })
+
     print("[INFO] Opening camera …")
-    cap = cv2.VideoCapture(CAMERA_URL)
+    cap = cv2.VideoCapture()
+    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+    cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+    cap.open(CAMERA_URL)
+    demo_mode = False
+    demo_gen = None
+    
     if not cap.isOpened():
-        print(f"[ERROR] Cannot open camera at {CAMERA_URL}")
-        return
+        print(f"[WARN] Cannot open camera at {CAMERA_URL}")
+        print(f"[INFO] Entering DEMO MODE with synthetic frames...")
+        demo_mode = True
+        demo_gen = DemoFrameGenerator(640, 480)
+    else:
+        print("[INFO] Using IP camera stream.")
 
     # ── Shared mutable state ──────────────────
     train_state     : str         = "GO"   # "GO" | "STOP"
     distance_cm     : float | None = None
     esp32_status    : str         = "DISCONNECTED"
-    camera_status   : str         = "CONNECTED"
+    camera_status   : str         = "DEMO" if demo_mode else "CONNECTED"
 
     detection_count : int  = 0    # persistent counter (goes up/down)
     track_memory    : int  = 0    # frames of on-track persistence
@@ -331,14 +412,22 @@ def main() -> None:  # noqa: C901  (complexity expected for a control loop)
         "stop_reason":     stop_reason,
         "timestamp":       "",
     }
+    startup_writer.stop()
     writer = StatusWriter(shared_state)
 
-    print("[INFO] System running.  ESC=exit  G=go  R=reset")
+    mode_str = "[DEMO MODE]" if demo_mode else "[LIVE MODE]"
+    print(f"{mode_str} System running.  ESC=exit  G=go  R=reset")
 
     while True:
-        ret, frame = cap.read()
+        if demo_mode:
+            frame = demo_gen.generate_frame()
+            ret = True
+        else:
+            ret, frame = cap.read()
+        
         if not ret:
             camera_status = "DISCONNECTED"
+            writer.update(camera_status=camera_status)
             print("[WARN] Frame grab failed, retrying …")
             time.sleep(0.05)
             continue
@@ -370,6 +459,13 @@ def main() -> None:  # noqa: C901  (complexity expected for a control loop)
                     if emergency_brake and not was_emergency:
                         stop_reason = f"EMERGENCY BRAKE · {distance_cm:.1f}cm" \
                                       if distance_cm else "EMERGENCY BRAKE"
+                        train_state = "STOP"  # Set to STOP immediately on emergency brake
+                        # Force immediate JSON update
+                        writer.update(
+                            train_state=train_state,
+                            stop_reason=stop_reason,
+                            emergency_brake=emergency_brake,
+                        )
                         log_event(
                             f"EMERGENCY BRAKE | distance={distance_cm}cm"
                         )
@@ -379,6 +475,11 @@ def main() -> None:  # noqa: C901  (complexity expected for a control loop)
                     if not emergency_brake and was_emergency:
                         if stop_reason.startswith("EMERGENCY BRAKE"):
                             stop_reason = "NONE"
+                            # Force immediate JSON update when emergency clears
+                            writer.update(
+                                stop_reason=stop_reason,
+                                emergency_brake=False,
+                            )
 
             # ── Reconnect detection ───────────────────────────
             if currently_connected and not prev_esp32_connected:
@@ -386,6 +487,12 @@ def main() -> None:  # noqa: C901  (complexity expected for a control loop)
                 send_command(resync_url)
                 distance_cm = None
                 emergency_brake = False
+                # Force JSON update on reconnect
+                writer.update(
+                    distance_cm=distance_cm,
+                    emergency_brake=False,
+                    esp32_status=esp32_status,
+                )
                 log_event(
                     f"ESP32 RECONNECTED | resynced with "
                     f"{'STOP' if stop_latched else 'GO'}"
@@ -451,10 +558,17 @@ def main() -> None:  # noqa: C901  (complexity expected for a control loop)
                     stop_reason  = f"{last_object.upper()} ON TRACK · {distance_cm:.1f}cm"
                     send_command(ESP32_STOP_URL)
 
+                    # Force immediate JSON update on STOP
+                    writer.update(
+                        train_state=train_state,
+                        stop_latched=stop_latched,
+                        stop_reason=stop_reason,
+                    )
+
                     # Save single incident image (overwrite)
                     cv2.imwrite(str(INCIDENT_IMAGE_PATH), frame)
 
-                    # Log event
+                    # Log critical event
                     log_event(
                         f"STOP | object={last_object} | "
                         f"distance={distance_cm:.1f}cm | "
@@ -524,6 +638,14 @@ def main() -> None:  # noqa: C901  (complexity expected for a control loop)
                 detection_count = 0
                 track_memory    = 0
                 send_command(ESP32_GO_URL)
+                # Force immediate JSON update on state change
+                writer.update(
+                    train_state=train_state,
+                    stop_latched=stop_latched,
+                    stop_reason=stop_reason,
+                    detection_count=detection_count,
+                    track_memory=track_memory,
+                )
                 print("[GO] Manual resume — /go sent to ESP32")
             else:
                 print("[INFO] Train already moving.")
@@ -548,7 +670,8 @@ def main() -> None:  # noqa: C901  (complexity expected for a control loop)
 
     # ── Cleanup ───────────────────────────────────────────────
     writer.stop()
-    cap.release()
+    if not demo_mode:
+        cap.release()
     cv2.destroyAllWindows()
     print("[INFO] Shutdown complete.")
 

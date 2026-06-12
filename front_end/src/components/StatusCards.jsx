@@ -35,35 +35,36 @@ export default function StatusCards({ telemetry = {}, isConnected }) {
     timestamp: telemetry?.timestamp || ''
   };
 
-  // Status coloring utility
+  // Status coloring utility aligned with backend warnings
   const getStatusStyle = (val, type = '') => {
     if (!isConnected) return 'text-slate-500 bg-slate-900/40 border-slate-800/80';
     const normalized = String(val || 'UNKNOWN').toUpperCase();
 
-    // Red condition lists
+    // Red condition lists (DANGER)
     if (
       normalized === 'STOP' ||
-      normalized === 'UNSAFE' ||
-      normalized === 'PERSON' ||
+      normalized === 'ON TRACK' ||  // Object on track = RED danger
       (type === 'emergency_brake' && val === true) ||
-      (type === 'distance_safe' && val === false)
+      (type === 'distance_safe' && val === false) ||
+      (type === 'track_status' && normalized === 'ON TRACK')
     ) {
       return 'text-red-400 bg-red-950/40 border-red-500/30 font-bold';
     }
 
-    // Green condition lists
+    // Green condition lists (SAFE)
     if (
+      normalized === 'GO' ||
       normalized === 'CONNECTED' ||
       normalized === 'SAFE' ||
-      normalized === 'RUN' ||
-      normalized === 'ON TRACK' ||
+      normalized === 'OFF TRACK' ||  // Object off track = GREEN safe
       (type === 'emergency_brake' && val === false) ||
-      (type === 'distance_safe' && val === true)
+      (type === 'distance_safe' && val === true) ||
+      (type === 'track_status' && normalized === 'OFF TRACK')
     ) {
       return 'text-emerald-400 bg-emerald-950/40 border-emerald-500/30 font-semibold';
     }
 
-    // Yellow condition lists
+    // Yellow condition lists (WARNING)
     if (
       normalized === 'SLOW' ||
       normalized === 'WARNING' ||

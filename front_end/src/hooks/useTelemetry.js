@@ -59,13 +59,20 @@ export default function useTelemetry() {
           // Standardize object detection check
           const primaryObject = String(data?.object_detected || data?.object || 'NONE');
           const hasObject = (primaryObject || 'NONE').toUpperCase() !== 'NONE';
-          const isDangerState = data?.train_state === 'STOP' || data?.distance_safe === false || data?.emergency_brake === true;
+          const isOnTrack = data?.track_status === 'ON TRACK';
+          const isUnsafeDistance = data?.distance_safe === false;
+          const isEmergencyBrake = data?.emergency_brake === true;
+          
+          // Risk levels aligned with backend: HIGH = STOP OR emergency OR (on track + unsafe distance)
+          const isHighRisk = data?.train_state === 'STOP' || isEmergencyBrake || (isOnTrack && isUnsafeDistance);
+          const isMediumRisk = isOnTrack && hasObject && !isHighRisk;
+          const riskLevel = isHighRisk ? 'HIGH' : (isMediumRisk ? 'MEDIUM' : 'LOW');
 
           // Update summary metrics
           setStats(prev => ({
             totalDetections: hasObject ? prev.totalDetections + 1 : prev.totalDetections,
-            totalAlerts: isDangerState ? prev.totalAlerts + 1 : prev.totalAlerts,
-            lastAlertTime: isDangerState ? currentTimestamp : prev.lastAlertTime
+            totalAlerts: (isHighRisk || isMediumRisk) ? prev.totalAlerts + 1 : prev.totalAlerts,
+            lastAlertTime: (isHighRisk || isMediumRisk) ? currentTimestamp : prev.lastAlertTime
           }));
 
           // Add to event log
@@ -74,7 +81,7 @@ export default function useTelemetry() {
             timestamp: currentTimestamp,
             object: primaryObject,
             distance: data?.distance_cm || 0,
-            risk: isDangerState ? 'HIGH' : (hasObject ? 'MEDIUM' : 'LOW'),
+            risk: riskLevel,
             decision: data?.train_state || 'UNKNOWN',
             stopReason: data?.stop_reason || ''
           };
@@ -91,14 +98,20 @@ export default function useTelemetry() {
             }
           }
 
-          if (hasObject && lastObjectRef.current !== primaryObject) {
-            triggerToast(`OBJECT DETECTED: "${(primaryObject || 'NONE').toUpperCase()}" identified on railway path.`, 'MEDIUM');
+          if (isEmergencyBrake && lastDistanceSafeRef.current !== false) {
+            triggerToast(`EMERGENCY BRAKE TRIGGERED: Hardware emergency stop activated!`, 'HIGH');
           }
 
-          if (data?.distance_safe === false && lastDistanceSafeRef.current !== false) {
-            triggerToast(`SAFETY BREACH: Distance threshold exceeded! Range: ${data?.distance_cm || 0} cm`, 'HIGH');
-          } else if (data?.distance_safe === true && lastDistanceSafeRef.current === false) {
-            triggerToast("SYSTEM SECURED: Target cleared, distance safe.", 'LOW');
+          if (isOnTrack && isUnsafeDistance && lastDistanceSafeRef.current !== false) {
+            triggerToast(`SAFETY BREACH: Object on track at ${data?.distance_cm?.toFixed(1) || 0} cm (threshold: 70 cm)`, 'HIGH');
+          }
+
+          if (isOnTrack && hasObject && !isHighRisk && lastObjectRef.current !== primaryObject) {
+            triggerToast(`OBJECT DETECTED ON TRACK: "${(primaryObject || 'NONE').toUpperCase()}" at ${data?.distance_cm?.toFixed(1) || 0} cm`, 'MEDIUM');
+          }
+
+          if (!isOnTrack && lastDistanceSafeRef.current === false) {
+            triggerToast("SYSTEM SECURED: Object cleared from track, safe distance restored.", 'LOW');
           }
 
           // Update tracking refs

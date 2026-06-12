@@ -42,17 +42,24 @@ export default function Dashboard() {
     }
   }, [theme]);
 
-  // Emergency conditions
+  // Emergency conditions (aligned with backend logic)
   const objectDetected = String(telemetry?.object_detected || telemetry?.object || 'NONE');
   const hasObject = (objectDetected || 'NONE').toUpperCase() !== 'NONE';
   const isStopState = telemetry?.train_state === 'STOP';
+  const isEmergencyBrake = telemetry?.emergency_brake === true;
+  const isOnTrack = telemetry?.track_status === 'ON TRACK';
   const isUnsafeDistance = telemetry?.distance_safe === false;
+  
+  // HIGH RISK: train_state=STOP OR emergency_brake=true OR (on track AND unsafe distance)
+  const isHighRisk = isStopState || isEmergencyBrake || (isOnTrack && isUnsafeDistance);
+  // MEDIUM RISK: on track with object detected
+  const isMediumRisk = isOnTrack && hasObject;
 
-  const showEmergencyBanner = isConnected && telemetry && (isStopState || hasObject || isUnsafeDistance);
+  const showEmergencyBanner = isConnected && telemetry && (isHighRisk || isMediumRisk);
 
   return (
     <div className={`min-h-screen flex flex-col font-sans relative antialiased transition-all grid-bg ${
-      isStopState && isConnected ? 'border-4 border-red-500 animate-flash-red' : ''
+      isHighRisk && isConnected ? 'border-4 border-red-500 animate-flash-red' : ''
     }`}>
       {/* Warning Screen Flash Red overlay when emergency banner conditions are active */}
       {showEmergencyBanner && (
@@ -89,7 +96,7 @@ export default function Dashboard() {
                 Stop Reason: <span className="text-red-200">{telemetry?.stop_reason || 'Safety Condition Triggered'}</span>
               </div>
               <div className="text-xs text-red-300 font-semibold mt-1">
-                Active System Command: STOP SIGNAL DEPLOYED | Object: {(objectDetected || 'NONE').toUpperCase()} | Distance Status: UNSAFE
+                Track: {telemetry?.track_status || 'UNKNOWN'} | Distance: {telemetry?.distance_cm?.toFixed(1) || 'N/A'} cm | Object: {(objectDetected || 'NONE').toUpperCase()}
               </div>
             </div>
           </div>
